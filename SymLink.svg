@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="baseTile" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4A3525"/>
+      <stop offset="100%" stop-color="#241812"/>
+    </linearGradient>
+    <linearGradient id="beigeAccent" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#A48264"/>
+      <stop offset="50%" stop-color="#CBB59D"/>
+      <stop offset="100%" stop-color="#F2E6D8"/>
+    </linearGradient>
+    <filter id="softGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <rect x="56" y="56" width="400" height="400" rx="92" fill="url(#baseTile)" filter="url(#softGlow)"/>
+  <rect x="56" y="56" width="400" height="400" rx="92" fill="none" stroke="#D7C4B0" stroke-width="4" stroke-opacity="0.25"/>
+  <path d="M136 156 C136 142 146 132 160 132 L352 132 C366 132 376 142 376 156 L376 196 L136 196 Z" fill="#EADBCE" fill-opacity="0.08"/>
+  <circle cx="170" cy="164" r="7" fill="#EADBCE" fill-opacity="0.75"/>
+  <circle cx="194" cy="164" r="7" fill="#CBB59D" fill-opacity="0.55"/>
+  <circle cx="218" cy="164" r="7" fill="#8D6E53" fill-opacity="0.45"/>
+  <circle cx="196" cy="316" r="34" fill="none" stroke="url(#beigeAccent)" stroke-width="26" stroke-linecap="round"/>
+  <path d="M220 292 L316 196" fill="none" stroke="url(#beigeAccent)" stroke-width="26" stroke-linecap="round"/>
+  <path d="M250 196 L316 196 L316 262" fill="none" stroke="url(#beigeAccent)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
