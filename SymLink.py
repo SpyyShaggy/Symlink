@@ -7,7 +7,10 @@ import subprocess
 import json
 import shutil
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+import threading
+import time
+import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -30,8 +33,8 @@ RUNNERS_DIR = os.path.expanduser("~/.local/share/desktop_maker/runners")
 LAST_LOG_PATH = "/tmp/dm_last_launch.log"
 
 DEFAULT_CONFIG = {
-    "target_dir": "/home/spyyshaggy",
-    "icons_dir": "/home/spyyshaggy/Изображения",
+    "target_dir": os.path.expanduser("~"),
+    "icons_dir": os.path.expanduser("~/Изображения") if os.path.isdir(os.path.expanduser("~/Изображения")) else os.path.expanduser("~/Pictures"),
     "also_app_menu": True,
     "theme": "AMOLED Black",
     "custom_proton": ""
@@ -49,6 +52,30 @@ THEMES = {
         "btn_fg": "#f4f4f5",
         "accent": "#6366f1",
         "border": "#232334"
+    },
+    "Пастельная (Кофе/Беж)": {
+        "bg": "#1e1814",
+        "card": "#28201a",
+        "fg": "#f2e6d8",
+        "muted": "#a89687",
+        "entry_bg": "#18130f",
+        "entry_fg": "#faf5ef",
+        "btn_bg": "#362b23",
+        "btn_fg": "#f4ece4",
+        "accent": "#cbb59d",
+        "border": "#46372e"
+    },
+    "Пастельная светлая (Латте)": {
+        "bg": "#f8f3ed",
+        "card": "#ffffff",
+        "fg": "#2e221b",
+        "muted": "#857062",
+        "entry_bg": "#ffffff",
+        "entry_fg": "#241812",
+        "btn_bg": "#eadbce",
+        "btn_fg": "#2e221b",
+        "accent": "#9e7b5c",
+        "border": "#d7c4b0"
     },
     "Темно-зеленый": {
         "bg": "#050807",
@@ -497,140 +524,1096 @@ def extract_icons_from_exe_pure_python(exe_path, out_dir, stem):
     return results
 
 
+def format_file_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes} Б"
+    for unit in ["КБ", "МБ", "ГБ", "ТБ"]:
+        size_bytes /= 1024.0
+        if size_bytes < 1024.0 or unit == "ТБ":
+            return f"{size_bytes:.1f} {unit}"
+    return f"{size_bytes:.1f} Б"
+
+
+def get_file_type_and_icon(filename, is_dir=False):
+    if is_dir:
+        return "📁", "Папка"
+    fl = filename.lower()
+    if fl.endswith(".exe"):
+        return "🎮", "Игра / EXE Windows"
+    if fl.endswith((".sh", ".bin", ".bash", ".run", ".cmd", ".bat")):
+        return "⚙️", "Скрипт Linux / Бинарник"
+    if fl.endswith(".appimage"):
+        return "📦", "AppImage пакет"
+    if fl.endswith(".desktop"):
+        return "🖥️", "Ярлык .desktop"
+    if fl.endswith(".py"):
+        return "🐍", "Python скрипт"
+    if fl.endswith((".png", ".svg", ".ico", ".jpg", ".jpeg", ".webp", ".xpm")):
+        ext = os.path.splitext(fl)[1].replace(".", "").upper()
+        return "🖼️", f"Изображение {ext}"
+    if fl.endswith((".zip", ".tar", ".gz", ".7z", ".rar", ".xz")):
+        return "🗜️", "Архив"
+    if fl.endswith((".txt", ".log", ".md", ".ini", ".cfg", ".conf")):
+        return "📄", "Документ / Конфиг"
+    return "📄", "Файл"
+
+
 class CustomPathDialog(tk.Toplevel):
-    """Окно выбора файла или папки без блокировок Wayland."""
+    """Современный двухпанельный проводник с закладками, фильтрацией и подсветкой исполняемых файлов."""
     def __init__(self, parent, title, init_dir, theme_colors, mode="file", exts=None):
         super().__init__(parent)
         self.title(title)
-        self.geometry("680x470")
         self.transient(parent)
         self.result = None
         self.mode = mode
-        self.exts = exts
+        self.exts = tuple(exts) if exts else None
         self.colors = theme_colors
         self.configure(bg=self.colors["bg"])
 
+        # Центрирование окна
+        w, h = 920, 580
+        self.minsize(740, 460)
+        self.geometry(f"{w}x{h}")
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            x = max(0, px + (pw - w) // 2)
+            y = max(0, py + (ph - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
         cur_dir = init_dir if (init_dir and os.path.isdir(init_dir)) else os.path.expanduser("~")
-        self.path_var = tk.StringVar(value=cur_dir)
+        self.cur_dir = os.path.abspath(cur_dir)
 
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
-        ttk.Label(top, text="Путь (можно вставить и нажать Enter):").pack(anchor="w")
+        # История навигации (Назад / Вперёд)
+        self.history = [self.cur_dir]
+        self.history_idx = 0
+        self.navigating_history = False
 
-        bar = ttk.Frame(top)
-        bar.pack(fill="x", pady=4)
-        self.path_entry = ttk.Entry(bar, textvariable=self.path_var)
-        self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self.path_entry.bind("<Return>", lambda e: self.on_enter_path())
+        # Состояние сортировки
+        self.sort_col = "name"
+        self.sort_reverse = False
 
-        ttk.Button(bar, text="Перейти", width=9, command=self.on_enter_path).pack(side="left", padx=2)
-        ttk.Button(bar, text="⬆ Вверх", width=8, command=self.go_up).pack(side="left", padx=2)
+        # Переменные
+        self.path_var = tk.StringVar(value=self.cur_dir)
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.apply_filter())
+        self.show_hidden = tk.BooleanVar(value=False)
+        self.show_hidden.trace_add("write", lambda *_: self.refresh_dir(self.cur_dir, update_history=False))
 
-        mid = ttk.Frame(self, padding=(10, 0))
-        mid.pack(fill="both", expand=True)
+        # Переменная фильтра типов
+        self.filter_var = tk.StringVar()
+        self.setup_filter_options()
 
-        self.listbox = tk.Listbox(
-            mid, bg=self.colors["entry_bg"], fg=self.colors["entry_fg"],
-            selectbackground=self.colors["accent"], selectforeground="#ffffff",
-            highlightthickness=1, highlightbackground=self.colors["border"],
-            highlightcolor=self.colors["accent"], bd=0, font=("Sans", 10)
-        )
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=sb.set)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.listbox.bind("<Double-Button-1>", self.on_double_click)
+        self.current_items = []
 
-        bot = ttk.Frame(self, padding=10)
-        bot.pack(fill="x")
-        if self.mode == "dir":
-            ttk.Button(bot, text="Выбрать открытую папку", style="Accent.TButton", command=self.accept_current_dir).pack(side="right", padx=4)
-            ttk.Button(bot, text="Выбрать выделенную", command=self.accept_current).pack(side="right", padx=4)
-        else:
-            ttk.Button(bot, text="Выбрать файл", style="Accent.TButton", command=self.accept_current).pack(side="right", padx=4)
-        ttk.Button(bot, text="Отмена", command=self.destroy).pack(side="right", padx=4)
+        self.build_ui()
+        self.refresh_dir(self.cur_dir, update_history=False)
 
-        self.refresh_dir(cur_dir)
+        self.bind("<Escape>", lambda e: self.destroy())
         self.lift()
         self.focus_force()
 
-    def refresh_dir(self, d):
+    def setup_filter_options(self):
+        if self.mode == "dir":
+            self.filter_options = ["📁 Только папки"]
+            self.filter_var.set(self.filter_options[0])
+        elif self.exts and any(x in self.exts for x in (".png", ".jpg", ".ico", ".svg")):
+            self.filter_options = [
+                "🖼️ Изображения (*.png, *.svg, *.ico, *.jpg, *.webp)",
+                "📁 Все файлы (*.*)"
+            ]
+            self.filter_var.set(self.filter_options[0])
+        else:
+            self.filter_options = [
+                "🎮 Все исполняемые (*.exe, *.sh, *.bin, *.AppImage, *.py)",
+                "🪟 Игры Windows (*.exe)",
+                "🐧 Программы Linux (*.sh, *.bin, *.AppImage)",
+                "📁 Все файлы (*.*)"
+            ]
+            self.filter_var.set(self.filter_options[0])
+
+    def build_ui(self):
+        # ── Верхняя панель навигации ──
+        top = ttk.Frame(self, padding=(12, 10, 12, 6))
+        top.pack(fill="x")
+
+        nav_box = ttk.Frame(top)
+        nav_box.pack(fill="x", pady=(0, 6))
+
+        self.btn_back = ttk.Button(nav_box, text="◀", width=3, command=self.go_back)
+        self.btn_back.pack(side="left", padx=(0, 2))
+        self.btn_fwd = ttk.Button(nav_box, text="▶", width=3, command=self.go_forward)
+        self.btn_fwd.pack(side="left", padx=2)
+        ttk.Button(nav_box, text="⬆ Вверх", width=8, command=self.go_up).pack(side="left", padx=2)
+        ttk.Button(nav_box, text="⌂ Домой", width=8, command=self.go_home).pack(side="left", padx=2)
+        ttk.Button(nav_box, text="🔄", width=3, command=lambda: self.refresh_dir(self.cur_dir, update_history=False)).pack(side="left", padx=(2, 8))
+
+        self.path_entry = ttk.Entry(nav_box, textvariable=self.path_var)
+        self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.path_entry.bind("<Return>", lambda e: self.on_enter_path())
+        ttk.Button(nav_box, text="Перейти", width=9, command=self.on_enter_path).pack(side="left")
+
+        # Строка быстрого поиска и фильтров
+        filter_box = ttk.Frame(top)
+        filter_box.pack(fill="x")
+
+        ttk.Label(filter_box, text="Поиск:").pack(side="left", padx=(0, 6))
+        search_entry = ttk.Entry(filter_box, textvariable=self.search_var, width=22)
+        search_entry.pack(side="left", padx=(0, 12))
+
+        ttk.Label(filter_box, text="Тип:").pack(side="left", padx=(0, 6))
+        filter_cb = ttk.Combobox(filter_box, textvariable=self.filter_var, values=self.filter_options, state="readonly", width=38)
+        filter_cb.pack(side="left", padx=(0, 12))
+        filter_cb.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
+
+        hidden_cb = ttk.Checkbutton(filter_box, text="Скрытые файлы (.*)", variable=self.show_hidden)
+        hidden_cb.pack(side="left", padx=4)
+
+        # ── Основная рабочая область (Две панели) ──
+        body = ttk.Frame(self, padding=(12, 4, 12, 6))
+        body.pack(fill="both", expand=True)
+
+        paned = ttk.PanedWindow(body, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        # Левая панель: Быстрый доступ
+        quick_frame = ttk.Frame(paned, padding=(0, 0, 8, 0))
+        paned.add(quick_frame, weight=1)
+
+        ttk.Label(quick_frame, text="Быстрый доступ", style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
+
+        self.quick_box = tk.Listbox(
+            quick_frame, bg=self.colors["entry_bg"], fg=self.colors["entry_fg"],
+            selectbackground=self.colors["accent"], selectforeground="#ffffff",
+            highlightthickness=1, highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"], bd=0, font=("Sans", 9), activestyle="none"
+        )
+        self.quick_box.pack(fill="both", expand=True)
+        self.quick_box.bind("<<ListboxSelect>>", self.on_quick_select)
+
+        self.populate_quick_places()
+
+        # Правая панель: Таблица файлов (Treeview)
+        table_frame = ttk.Frame(paned)
+        paned.add(table_frame, weight=5)
+
+        cols = ("name", "size", "type", "mtime")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
+        self.tree.heading("name", text="Имя файла / папки", command=lambda: self.sort_by("name"))
+        self.tree.heading("size", text="Размер", command=lambda: self.sort_by("size"))
+        self.tree.heading("type", text="Тип", command=lambda: self.sort_by("type"))
+        self.tree.heading("mtime", text="Дата изменения", command=lambda: self.sort_by("mtime"))
+
+        self.tree.column("name", width=340, anchor="w")
+        self.tree.column("size", width=95, anchor="e")
+        self.tree.column("type", width=160, anchor="w")
+        self.tree.column("mtime", width=145, anchor="w")
+
+        tree_sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_sb.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        tree_sb.pack(side="right", fill="y")
+
+        self.tree.bind("<Double-Button-1>", self.on_tree_double_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Return>", lambda e: self.on_tree_enter())
+        self.tree.bind("<BackSpace>", lambda e: self.go_up())
+
+        # ── Нижняя панель действий ──
+        bot = ttk.Frame(self, padding=(12, 6, 12, 10))
+        bot.pack(fill="x")
+
+        # Строка выбранного объекта
+        sel_row = ttk.Frame(bot)
+        sel_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(sel_row, text="Выбрано:").pack(side="left", padx=(0, 6))
+        self.selected_var = tk.StringVar()
+        self.selected_entry = ttk.Entry(sel_row, textvariable=self.selected_var)
+        self.selected_entry.pack(side="left", fill="x", expand=True)
+        self.selected_entry.bind("<Return>", lambda e: self.accept_current())
+
+        # Кнопки действий и статус-бар
+        action_row = ttk.Frame(bot)
+        action_row.pack(fill="x")
+
+        self.status_lbl = ttk.Label(action_row, text="", style="Muted.TLabel")
+        self.status_lbl.pack(side="left")
+
+        ttk.Button(action_row, text="Отмена", width=10, command=self.destroy).pack(side="right", padx=(4, 0))
+        btn_text = "Выбрать эту папку" if self.mode == "dir" else "Выбрать файл"
+        ttk.Button(action_row, text=btn_text, style="Accent.TButton", command=self.accept_current).pack(side="right", padx=4)
+
+    def populate_quick_places(self):
+        home = os.path.expanduser("~")
+        places = [("⌂ Главная", home)]
+
+        standard_dirs = [
+            ("Рабочий стол", "🖥️ Рабочий стол"),
+            ("Desktop", "🖥️ Рабочий стол"),
+            ("Загрузки", "📥 Загрузки"),
+            ("Downloads", "📥 Загрузки"),
+            ("Игры", "🎮 Папка Игр"),
+            ("Games", "🎮 Папка Игр"),
+            ("Изображения", "🖼️ Изображения"),
+            ("Pictures", "🖼️ Изображения")
+        ]
+        seen_dirs = {home}
+        for sub, lbl in standard_dirs:
+            full = os.path.join(home, sub)
+            if os.path.isdir(full) and full not in seen_dirs:
+                places.append((lbl, full))
+                seen_dirs.add(full)
+
+        if os.path.isdir("/mnt/game") and "/mnt/game" not in seen_dirs:
+            places.append(("🎮 Диск Игры (/mnt/game)", "/mnt/game"))
+            seen_dirs.add("/mnt/game")
+
+        # Библиотеки Steam
+        for lib in get_steam_libraries():
+            common = os.path.join(lib, "steamapps", "common")
+            if os.path.isdir(common) and common not in seen_dirs:
+                places.append(("💨 Steam Common", common))
+                seen_dirs.add(common)
+
+        # Приложения
+        app_d = os.path.expanduser("~/.local/share/applications")
+        if os.path.isdir(app_d):
+            places.append(("⚙️ Приложения (.desktop)", app_d))
+
+        places.append(("💽 Корень (/)", "/"))
+
+        self.quick_places = places
+        self.quick_box.delete(0, tk.END)
+        for label, _ in places:
+            self.quick_box.insert(tk.END, f" {label}")
+
+    def on_quick_select(self, _):
+        sel = self.quick_box.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx < len(self.quick_places):
+            target = self.quick_places[idx][1]
+            if os.path.isdir(target):
+                self.refresh_dir(target)
+
+    def refresh_dir(self, d, update_history=True):
         if not os.path.isdir(d):
             return
         self.cur_dir = os.path.abspath(d)
         self.path_var.set(self.cur_dir)
-        self.listbox.delete(0, tk.END)
+
+        if update_history and not self.navigating_history:
+            if self.history_idx < len(self.history) - 1:
+                self.history = self.history[:self.history_idx + 1]
+            if not self.history or self.history[-1] != self.cur_dir:
+                self.history.append(self.cur_dir)
+                self.history_idx = len(self.history) - 1
+
+        self.update_nav_buttons()
+
         try:
-            items = os.listdir(self.cur_dir)
+            raw_entries = os.listdir(self.cur_dir)
         except PermissionError:
+            messagebox.showerror("Доступ запрещен", f"Нет прав доступа к папке:\n{self.cur_dir}", parent=self)
             return
 
-        dirs = sorted([x for x in items if os.path.isdir(os.path.join(self.cur_dir, x)) and not x.startswith(".")], key=str.lower)
-        files = sorted([x for x in items if os.path.isfile(os.path.join(self.cur_dir, x)) and not x.startswith(".")], key=str.lower)
+        show_hid = self.show_hidden.get()
+        items = []
+        for name in raw_entries:
+            if not show_hid and name.startswith("."):
+                continue
+            full_path = os.path.join(self.cur_dir, name)
+            try:
+                st = os.stat(full_path, follow_symlinks=True)
+                is_directory = stat.S_ISDIR(st.st_mode)
+                size_num = st.st_size if not is_directory else -1
+                mtime_num = st.st_mtime
+                mtime_str = datetime.datetime.fromtimestamp(mtime_num).strftime("%d.%m.%Y %H:%M")
+            except OSError:
+                is_directory = os.path.isdir(full_path)
+                size_num = -1
+                mtime_num = 0
+                mtime_str = "—"
 
-        for folder in dirs:
-            self.listbox.insert(tk.END, f"📁 {folder}")
+            icon, type_label = get_file_type_and_icon(name, is_directory)
+            size_str = "—" if is_directory else format_file_size(size_num)
+            display_name = f"{icon}  {name}"
 
-        if self.mode == "file":
-            for f in files:
-                if self.exts and not any(f.lower().endswith(ext) for ext in self.exts):
-                    continue
-                self.listbox.insert(tk.END, f)
+            items.append({
+                "name": name,
+                "display_name": display_name,
+                "full_path": full_path,
+                "is_dir": is_directory,
+                "size_num": size_num,
+                "size_str": size_str,
+                "type_str": type_label,
+                "mtime_num": mtime_num,
+                "mtime_str": mtime_str
+            })
+
+        self.current_items = items
+        self.apply_filter()
+
+    def update_nav_buttons(self):
+        can_back = self.history_idx > 0
+        can_fwd = self.history_idx < len(self.history) - 1
+        self.btn_back.state(["!disabled"] if can_back else ["disabled"])
+        self.btn_fwd.state(["!disabled"] if can_fwd else ["disabled"])
+
+    def go_back(self):
+        if self.history_idx > 0:
+            self.history_idx -= 1
+            self.navigating_history = True
+            self.refresh_dir(self.history[self.history_idx], update_history=False)
+            self.navigating_history = False
+
+    def go_forward(self):
+        if self.history_idx < len(self.history) - 1:
+            self.history_idx += 1
+            self.navigating_history = True
+            self.refresh_dir(self.history[self.history_idx], update_history=False)
+            self.navigating_history = False
 
     def go_up(self):
         parent = os.path.dirname(self.cur_dir)
         if parent and parent != self.cur_dir:
             self.refresh_dir(parent)
 
-    def on_enter_path(self):
-        p = os.path.expanduser(self.path_var.get().strip())
-        if os.path.isdir(p):
-            self.refresh_dir(p)
-        elif os.path.isfile(p) and self.mode == "file":
-            self.result = os.path.abspath(p)
-            self.destroy()
+    def go_home(self):
+        self.refresh_dir(os.path.expanduser("~"))
 
-    def on_double_click(self, _):
-        sel = self.listbox.curselection()
+    def on_enter_path(self):
+        raw = os.path.expanduser(self.path_var.get().strip())
+        if os.path.isdir(raw):
+            self.refresh_dir(raw)
+        elif os.path.isfile(raw) and self.mode == "file":
+            self.result = os.path.abspath(raw)
+            self.destroy()
+        else:
+            messagebox.showwarning("Путь не найден", f"Указанный путь не существует:\n{raw}", parent=self)
+
+    def apply_filter(self):
+        query = self.search_var.get().strip().lower()
+        active_filter = self.filter_var.get()
+
+        filtered = []
+        for it in self.current_items:
+            # Текстовый поиск
+            if query and (query not in it["name"].lower()):
+                continue
+
+            # Фильтр типов
+            if not it["is_dir"]:
+                fn = it["name"].lower()
+                if "Только Windows (*.exe)" in active_filter and not fn.endswith(".exe"):
+                    continue
+                if "Только Linux" in active_filter and not fn.endswith((".sh", ".bin", ".appimage", ".py")):
+                    continue
+                if "Все исполняемые" in active_filter and not fn.endswith((".exe", ".sh", ".bin", ".appimage", ".py", ".bat", ".cmd")):
+                    continue
+                if "Изображения" in active_filter and not fn.endswith((".png", ".svg", ".ico", ".jpg", ".jpeg", ".webp", ".xpm")):
+                    continue
+                if self.mode == "dir":
+                    continue
+                if self.exts and not any(fn.endswith(ext.lower()) for ext in self.exts):
+                    continue
+
+            filtered.append(it)
+
+        # Сортировка: папки всегда сверху!
+        col = self.sort_col
+        rev = self.sort_reverse
+
+        def sort_key(item):
+            dir_rank = 0 if item["is_dir"] else 1
+            if col == "name":
+                val = item["name"].lower()
+            elif col == "size":
+                val = item["size_num"]
+            elif col == "type":
+                val = item["type_str"].lower()
+            elif col == "mtime":
+                val = item["mtime_num"]
+            else:
+                val = item["name"].lower()
+            return (dir_rank, val)
+
+        filtered.sort(key=sort_key, reverse=rev)
+
+        self.tree.delete(*self.tree.get_children())
+        for it in filtered:
+            self.tree.insert(
+                "", "end", iid=it["full_path"],
+                values=(it["display_name"], it["size_str"], it["type_str"], it["mtime_str"])
+            )
+
+        dirs_cnt = sum(1 for x in filtered if x["is_dir"])
+        files_cnt = len(filtered) - dirs_cnt
+        self.status_lbl.config(text=f"Папок: {dirs_cnt} · Файлов: {files_cnt} · Всего: {len(filtered)}")
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
+        self.apply_filter()
+
+    def on_tree_select(self, _):
+        sel = self.tree.selection()
         if not sel:
             return
-        val = self.listbox.get(sel[0])
-        if val.startswith("📁 "):
-            folder = val.replace("📁 ", "", 1)
-            self.refresh_dir(os.path.join(self.cur_dir, folder))
-        else:
-            full = os.path.join(self.cur_dir, val)
-            self.path_var.set(full)
-            if self.mode == "file":
-                self.result = full
-                self.destroy()
+        full_p = sel[0]
+        if os.path.isfile(full_p):
+            self.selected_var.set(full_p)
+            sz = format_file_size(os.path.getsize(full_p))
+            self.status_lbl.config(text=f"Выбран файл: {os.path.basename(full_p)} ({sz})")
+        elif os.path.isdir(full_p):
+            self.selected_var.set(full_p)
+            self.status_lbl.config(text=f"Выбрана папка: {os.path.basename(full_p)}")
 
-    def accept_current_dir(self):
-        p = os.path.expanduser(self.path_var.get().strip())
-        if os.path.isdir(p):
-            self.result = os.path.abspath(p)
+    def on_tree_enter(self):
+        sel = self.tree.selection()
+        if not sel:
+            self.accept_current()
+            return
+        full_p = sel[0]
+        if os.path.isdir(full_p):
+            self.refresh_dir(full_p)
+        else:
+            self.accept_current()
+
+    def on_tree_double_click(self, _):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        full_p = sel[0]
+        if os.path.isdir(full_p):
+            self.refresh_dir(full_p)
+        else:
+            self.result = full_p
             self.destroy()
 
     def accept_current(self):
-        sel = self.listbox.curselection()
-        if sel:
-            val = self.listbox.get(sel[0])
-            if val.startswith("📁 "):
-                chosen = os.path.join(self.cur_dir, val.replace("📁 ", "", 1))
+        chosen = self.selected_var.get().strip()
+        if not chosen:
+            sel = self.tree.selection()
+            if sel:
+                chosen = sel[0]
             else:
-                chosen = os.path.join(self.cur_dir, val)
-        else:
-            chosen = os.path.expanduser(self.path_var.get().strip())
+                chosen = self.cur_dir
 
-        if self.mode == "dir" and os.path.isdir(chosen):
-            self.result = os.path.abspath(chosen)
-            self.destroy()
-        elif self.mode == "file" and os.path.exists(chosen) and not os.path.isdir(chosen):
-            self.result = os.path.abspath(chosen)
-            self.destroy()
-        elif self.mode == "file" and not os.path.isdir(chosen) and chosen:
-            self.result = chosen
-            self.destroy()
+        chosen = os.path.abspath(os.path.expanduser(chosen))
+
+        if self.mode == "dir":
+            if os.path.isdir(chosen):
+                self.result = chosen
+                self.destroy()
+            elif os.path.isdir(self.cur_dir):
+                self.result = self.cur_dir
+                self.destroy()
+        else:
+            if os.path.isfile(chosen):
+                self.result = chosen
+                self.destroy()
+            elif os.path.isdir(chosen):
+                self.refresh_dir(chosen)
+            elif os.path.exists(chosen):
+                self.result = chosen
+                self.destroy()
+
+
+def download_image_as_png(url, out_png):
+    """Безопасно скачивает картинку по URL и конвертирует в PNG."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            data = resp.read()
+            if len(data) < 80:
+                return None
+            tmp_dl = f"/tmp/dl_ico_{os.getpid()}_{hash(url) & 0xffffffff}"
+            with open(tmp_dl, "wb") as f:
+                f.write(data)
+            conv = convert_to_png(tmp_dl, out_png)
+            try:
+                if os.path.exists(tmp_dl) and tmp_dl != conv:
+                    os.remove(tmp_dl)
+            except OSError:
+                pass
+            return conv if (conv and os.path.isfile(conv) and os.path.getsize(conv) > 0) else None
+    except Exception:
+        return None
+
+
+def fetch_steam_icons_online(query_or_appid, icons_dir):
+    """Ищет официальные логотипы в Steam API / CDN и сохраняет в PNG."""
+    results = []
+    os.makedirs(icons_dir, exist_ok=True)
+    appid = None
+    query = str(query_or_appid).strip()
+
+    if query.isdigit() and len(query) >= 2 and query != "480":
+        appid = query
+        game_title = f"AppID {appid}"
+    else:
+        clean = re.sub(r"[\-_.]", " ", query)
+        clean = re.sub(r"(?i)\b(shipping|win64|win32|binaries|launcher|game|exe|x64|x86)\b", " ", clean)
+        clean = " ".join(clean.split())
+        if not clean or clean.lower() == "spacewar":
+            return results
+        game_title = clean
+
+        try:
+            api_url = f"https://store.steampowered.com/api/storesearch/?term={quote(clean)}&l=russian&cc=RU"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                data = json.loads(resp.read().decode("utf-8", "ignore"))
+                items = data.get("items", [])
+                if items:
+                    appid = str(items[0].get("id"))
+                    game_title = items[0].get("name", clean)
+        except Exception:
+            pass
+
+    if appid and appid != "480":
+        safe_stem = re.sub(r"\W+", "_", game_title.lower()).strip("_") or f"steam_{appid}"
+        # 1. Прозрачное PNG лого из CDN Steam
+        cdn_logo = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/logo.png"
+        out_logo = os.path.join(icons_dir, f"{safe_stem}_steam_logo.png")
+        p = download_image_as_png(cdn_logo, out_logo)
+        if p:
+            results.append((130, f"[Steam Онлайн] {os.path.basename(p)}", p))
+
+        # 2. Обложка Header
+        cdn_hdr = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"
+        out_hdr = os.path.join(icons_dir, f"{safe_stem}_steam_header.png")
+        p_h = download_image_as_png(cdn_hdr, out_hdr)
+        if p_h:
+            results.append((105, f"[Steam Обложка] {os.path.basename(p_h)}", p_h))
+
+    return results
+
+
+def fetch_website_icons_online(site_url, icons_dir):
+    """Ищет favicon, apple-touch-icon и og:image сайта и сохраняет в PNG."""
+    results = []
+    os.makedirs(icons_dir, exist_ok=True)
+    norm = normalize_url(site_url)
+    domain = urlparse(norm).netloc.lower().replace("www.", "")
+    stem = domain.split(".")[0] if domain else "site"
+
+    # 1. Google Favicon 128px
+    fav_url = f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+    out_fav = os.path.join(icons_dir, f"{stem}_favicon.png")
+    p1 = download_image_as_png(fav_url, out_fav)
+    if p1 and os.path.getsize(p1) > 100:
+        results.append((125, f"[Сайт] {os.path.basename(p1)}", p1))
+
+    # 2. DuckDuckGo ICO/PNG
+    ddg_url = f"https://icons.duckduckgo.com/ip3/{domain}.ico"
+    out_ddg = os.path.join(icons_dir, f"{stem}_ddg.png")
+    p2 = download_image_as_png(ddg_url, out_ddg)
+    if p2 and os.path.getsize(p2) > 100:
+        results.append((115, f"[Сайт DDG] {os.path.basename(p2)}", p2))
+
+    # 3. Парсинг HTML
+    try:
+        req = urllib.request.Request(norm, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            html = resp.read().decode("utf-8", "ignore")
+            m_apple = re.search(r'<link[^>]+(?:rel=["\'](?:apple-touch-icon|icon)["\'][^>]+href=["\']([^"\']+)["\']|href=["\']([^"\']+)["\'][^>]+rel=["\'](?:apple-touch-icon|icon)["\'])', html, re.IGNORECASE)
+            if m_apple:
+                icon_href = m_apple.group(1) or m_apple.group(2)
+                if not icon_href.startswith(("http://", "https://")):
+                    base = f"https://{domain}" if not norm.startswith("http") else norm.rstrip("/")
+                    icon_href = urllib.parse.urljoin(base + "/", icon_href.lstrip("/"))
+                out_web = os.path.join(icons_dir, f"{stem}_touch_icon.png")
+                p3 = download_image_as_png(icon_href, out_web)
+                if p3 and os.path.getsize(p3) > 200:
+                    results.append((130, f"[Сайт HD] {os.path.basename(p3)}", p3))
+    except Exception:
+        pass
+
+    return results
+
+
+def make_thumbnail_photo(path, size=72):
+    """Генерирует аккуратный PhotoImage для карточки галереи и путь к временному файлу."""
+    try:
+        tmp_t = f"/tmp/gal_th_{os.getpid()}_{hash(path) & 0xffffffff}_{size}.png"
+        if HAS_GDK:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size, size, True)
+            pb.savev(tmp_t, "png", [], [])
+            return tk.PhotoImage(file=tmp_t), tmp_t
+        elif HAS_PIL:
+            with Image.open(path) as im:
+                im.thumbnail((size, size))
+                im.save(tmp_t, "PNG")
+            return tk.PhotoImage(file=tmp_t), tmp_t
+        elif path.lower().endswith(".png"):
+            raw_p = tk.PhotoImage(file=path)
+            f_sub = max(1, max(raw_p.width(), raw_p.height()) // size)
+            return raw_p.subsample(f_sub, f_sub), None
+    except Exception:
+        pass
+    return None, None
+
+
+class IconGalleryDialog(tk.Toplevel):
+    """Полнофункциональная, красивая и отзывчивая галерея логотипов с онлайн-поиском и предпросмотром."""
+    def __init__(self, parent, app, found_icons, on_pick_callback):
+        super().__init__(parent)
+        self.app = app
+        self.colors = app.colors
+        self.on_pick_callback = on_pick_callback
+        self.all_icons = list(found_icons)
+        self.temp_thumbs = []
+        self.thumb_refs = []
+        self.card_widgets = []
+        self.selected_path = None
+
+        self.title("Галерея логотипов")
+        self.configure(bg=self.colors["bg"])
+        self.transient(parent)
+
+        w, h = 920, 620
+        self.minsize(740, 480)
+        self.geometry(f"{w}x{h}")
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            x = max(0, px + (pw - w) // 2)
+            y = max(0, py + (ph - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+        self.category_var = tk.StringVar(value="ALL")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.render_grid())
+
+        # Определение начального запроса для онлайн-поиска
+        init_query = ""
+        current_input = self.app.file_var.get().strip().strip("\"'")
+        if is_url(current_input):
+            init_query = urlparse(normalize_url(current_input)).netloc.lower().replace("www.", "")
+        elif current_input:
+            init_query = os.path.splitext(os.path.basename(current_input))[0]
+            init_query = re.sub(r"(?i)\b(shipping|win64|win32|binaries|launcher|game)\b", "", init_query).strip("-_ ")
+        if not init_query and self.app.name_var.get().strip():
+            init_query = self.app.name_var.get().strip()
+        self.online_search_var = tk.StringVar(value=init_query)
+
+        self.build_ui()
+        self.render_grid()
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.bind("<Escape>", lambda e: self.on_close())
+        self.lift()
+        self.focus_force()
+
+    def build_ui(self):
+        # ── Верхняя панель ──
+        top = ttk.Frame(self, padding=(14, 12, 14, 6))
+        top.pack(fill="x")
+
+        # Строка 1: Фильтр и категории
+        r1 = ttk.Frame(top)
+        r1.pack(fill="x", pady=(0, 6))
+
+        ttk.Label(r1, text="Фильтр:").pack(side="left", padx=(0, 6))
+        s_entry = ttk.Entry(r1, textvariable=self.search_var, width=18)
+        s_entry.pack(side="left", padx=(0, 10))
+
+        cats = [
+            ("Все", "ALL"),
+            ("🎮 Из игры / .exe", "EXE"),
+            ("💨 Steam", "STEAM"),
+            ("🌐 Веб / Онлайн", "WEB"),
+            ("🖼️ Изображения", "PICS")
+        ]
+        for lbl, val in cats:
+            rb = ttk.Radiobutton(r1, text=lbl, value=val, variable=self.category_var, command=self.render_grid)
+            rb.pack(side="left", padx=4)
+
+        # Строка 2: Онлайн-поиск и действия
+        r2 = ttk.Frame(top)
+        r2.pack(fill="x")
+
+        ttk.Label(r2, text="🌐 Найти в сети:").pack(side="left", padx=(0, 6))
+        q_entry = ttk.Entry(r2, textvariable=self.online_search_var, width=26)
+        q_entry.pack(side="left", padx=(0, 6))
+        q_entry.bind("<Return>", lambda e: self.start_online_search())
+
+        self.btn_online = ttk.Button(r2, text="🔍 Искать логотипы", command=self.start_online_search)
+        self.btn_online.pack(side="left", padx=2)
+
+        ttk.Button(r2, text="📋 Из буфера", command=self.import_from_clipboard).pack(side="left", padx=2)
+        ttk.Button(r2, text="📁 Обзор файла...", command=self.browse_custom_icon).pack(side="left", padx=2)
+
+        self.online_status = ttk.Label(r2, text="", style="Muted.TLabel")
+        self.online_status.pack(side="left", padx=(8, 0))
+
+        # ── Основная рабочая область ──
+        body = ttk.Frame(self, padding=(14, 4, 14, 6))
+        body.pack(fill="both", expand=True)
+
+        paned = ttk.PanedWindow(body, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        # Левая часть: Сетка иконок
+        grid_container = ttk.Frame(paned)
+        paned.add(grid_container, weight=4)
+
+        self.canvas = tk.Canvas(
+            grid_container, bg=self.colors["entry_bg"],
+            highlightthickness=1, highlightbackground=self.colors["border"]
+        )
+        self.sb = ttk.Scrollbar(grid_container, orient="vertical", command=self.canvas.yview)
+        self.scroll_frame = ttk.Frame(self.canvas)
+
+        self.scroll_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        self.canvas_win = self.canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.sb.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.sb.pack(side="right", fill="y")
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
+
+        # Колесо мыши
+        self.bind("<MouseWheel>", self.on_mousewheel)
+        self.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-2, "units"))
+        self.bind("<Button-5>", lambda e: self.canvas.yview_scroll(2, "units"))
+
+        # Правая часть: Предпросмотр и свойства
+        details_frame = ttk.Frame(paned, padding=(14, 8))
+        paned.add(details_frame, weight=1)
+
+        ttk.Label(details_frame, text="Предпросмотр", font=("Sans", 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        self.preview_canvas = tk.Canvas(
+            details_frame, width=130, height=130, bg=self.colors["entry_bg"],
+            highlightthickness=1, highlightbackground=self.colors["border"]
+        )
+        self.preview_canvas.pack(pady=(0, 10))
+
+        self.det_name = ttk.Label(details_frame, text="Выберите логотип", font=("Sans", 9, "bold"), wraplength=190)
+        self.det_name.pack(anchor="w", pady=2)
+
+        self.det_res = ttk.Label(details_frame, text="Разрешение: —", style="Muted.TLabel")
+        self.det_res.pack(anchor="w", pady=1)
+
+        self.det_size = ttk.Label(details_frame, text="Размер: —", style="Muted.TLabel")
+        self.det_size.pack(anchor="w", pady=1)
+
+        self.det_source = ttk.Label(details_frame, text="Источник: —", style="Muted.TLabel")
+        self.det_source.pack(anchor="w", pady=1)
+
+        self.det_path = ttk.Label(details_frame, text="", style="Muted.TLabel", wraplength=190, font=("Monospace", 8))
+        self.det_path.pack(anchor="w", pady=(6, 12))
+
+        ttk.Separator(details_frame, orient="horizontal").pack(fill="x", pady=6)
+
+        self.btn_apply = ttk.Button(details_frame, text="✓ Выбрать этот логотип", style="Accent.TButton", command=self.apply_selected)
+        self.btn_apply.pack(fill="x", pady=4)
+        ttk.Button(details_frame, text="Отмена", command=self.on_close).pack(fill="x", pady=4)
+
+        # ── Нижний статус-бар ──
+        bot = ttk.Frame(self, padding=(14, 4, 14, 8))
+        bot.pack(fill="x")
+        self.status_bar = ttk.Label(bot, text="", style="Muted.TLabel")
+        self.status_bar.pack(side="left")
+
+    def on_canvas_resize(self, event):
+        self.canvas.itemconfig(self.canvas_win, width=event.width)
+
+    def on_mousewheel(self, event):
+        if event.delta:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def render_grid(self):
+        # Очищаем карточки
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+
+        self.thumb_refs.clear()
+        self.card_widgets.clear()
+
+        query = self.search_var.get().strip().lower()
+        cat = self.category_var.get()
+
+        filtered = []
+        for score, label, path in self.all_icons:
+            if not os.path.isfile(path):
+                continue
+            lbl_low = label.lower()
+            if cat == "EXE" and not any(k in lbl_low for k in ("exe", "папка игры")):
+                continue
+            if cat == "STEAM" and "steam" not in lbl_low:
+                continue
+            if cat == "WEB" and not any(k in lbl_low for k in ("сайт", "онлайн")):
+                continue
+            if cat == "PICS" and not any(k in lbl_low for k in ("изображения", "система")):
+                continue
+            if query and (query not in lbl_low and query not in os.path.basename(path).lower()):
+                continue
+            filtered.append((score, label, path))
+
+        if not filtered:
+            empty_lbl = ttk.Label(
+                self.scroll_frame,
+                text="Логотипы не найдены.\nВоспользуйтесь онлайн-поиском или кнопкой 'Обзор...'",
+                style="Muted.TLabel", justify="center"
+            )
+            empty_lbl.pack(pady=40, fill="both", expand=True)
+            self.status_bar.config(text="Логотипы не найдены")
+            return
+
+        cols = 5
+        for idx, (score, label, path) in enumerate(filtered):
+            r, c = divmod(idx, cols)
+
+            card = tk.Frame(
+                self.scroll_frame, bg=self.colors["btn_bg"],
+                bd=1, relief="solid", highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                highlightcolor=self.colors["accent"],
+                padx=6, pady=6, cursor="hand2"
+            )
+            card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+
+            # Генерация превью
+            ph, tmp_t = make_thumbnail_photo(path, size=68)
+            if tmp_t:
+                self.temp_thumbs.append(tmp_t)
+
+            img_lbl = tk.Label(card, bg=self.colors["btn_bg"], width=72, height=72)
+            img_lbl.pack()
+
+            if ph:
+                self.thumb_refs.append(ph)
+                img_lbl.config(image=ph)
+            else:
+                img_lbl.config(text="PNG", fg=self.colors["fg"], font=("Sans", 9, "bold"))
+
+            # Бейдж категории
+            clean_tag = label.split("]")[0].replace("[", "").strip() if "]" in label else "Лого"
+            tag_lbl = tk.Label(
+                card, text=clean_tag, bg=self.colors["btn_bg"],
+                fg=self.colors["accent"], font=("Sans", 8, "bold")
+            )
+            tag_lbl.pack(pady=(2, 0))
+
+            # Имя файла
+            short_name = os.path.basename(path)
+            if len(short_name) > 16:
+                short_name = short_name[:14] + "…"
+            name_lbl = tk.Label(
+                card, text=short_name, bg=self.colors["btn_bg"],
+                fg=self.colors["fg"], font=("Sans", 8)
+            )
+            name_lbl.pack()
+
+            # Привязка событий клика и hover
+            for widget in (card, img_lbl, tag_lbl, name_lbl):
+                widget.bind("<Button-1>", lambda e, p=path, l=label, cd=card: self.select_icon(p, l, cd))
+                widget.bind("<Double-Button-1>", lambda e, p=path: self.choose_and_apply(p))
+                widget.bind("<Enter>", lambda e, cd=card: cd.configure(highlightbackground=self.colors["accent"]))
+                widget.bind("<Leave>", lambda e, cd=card: self.refresh_card_highlight(cd))
+
+            self.card_widgets.append((card, path))
+
+        for col_idx in range(cols):
+            self.scroll_frame.columnconfigure(col_idx, weight=1)
+
+        self.status_bar.config(text=f"Отображено: {len(filtered)} из {len(self.all_icons)} иконок")
+
+        # Автовыбор первой иконки, если ничего не выбрано
+        if filtered and not self.selected_path:
+            self.select_icon(filtered[0][2], filtered[0][1], self.card_widgets[0][0])
+
+    def refresh_card_highlight(self, card):
+        for cd, p in self.card_widgets:
+            if cd == card:
+                if p == self.selected_path:
+                    cd.configure(highlightbackground=self.colors["accent"], bd=2)
+                else:
+                    cd.configure(highlightbackground=self.colors["border"], bd=1)
+
+    def select_icon(self, path, label, card):
+        self.selected_path = path
+        for cd, p in self.card_widgets:
+            if p == path:
+                cd.configure(highlightbackground=self.colors["accent"], bd=2)
+            else:
+                cd.configure(highlightbackground=self.colors["border"], bd=1)
+
+        # Обновляем правый предпросмотр
+        self.preview_canvas.delete("all")
+        ph, tmp_t = make_thumbnail_photo(path, size=115)
+        if tmp_t:
+            self.temp_thumbs.append(tmp_t)
+        if ph:
+            self.preview_photo_ref = ph
+            self.preview_canvas.create_image(65, 65, image=ph)
+        else:
+            self.preview_canvas.create_text(65, 65, text="Логотип", fill=self.colors["muted"])
+
+        fn = os.path.basename(path)
+        self.det_name.config(text=fn)
+
+        # Читаем разрешение и размер
+        res_text = "—"
+        if HAS_PIL:
+            try:
+                with Image.open(path) as im:
+                    res_text = f"{im.width} × {im.height} px"
+            except Exception:
+                pass
+        self.det_res.config(text=f"Разрешение: {res_text}")
+
+        try:
+            sz_str = format_file_size(os.path.getsize(path))
+        except OSError:
+            sz_str = "—"
+        self.det_size.config(text=f"Размер: {sz_str}")
+
+        clean_tag = label.split("]")[0].replace("[", "").strip() if "]" in label else "Файл"
+        self.det_source.config(text=f"Источник: {clean_tag}")
+        self.det_path.config(text=path)
+
+    def choose_and_apply(self, path):
+        self.selected_path = path
+        self.apply_selected()
+
+    def apply_selected(self):
+        if not self.selected_path or not os.path.isfile(self.selected_path):
+            messagebox.showwarning("Внимание", "Сначала выберите логотип из списка!", parent=self)
+            return
+        p = self.selected_path
+        self.on_pick_callback(p)
+        self.on_close()
+
+    def start_online_search(self):
+        query = self.online_search_var.get().strip()
+        if not query:
+            messagebox.showwarning("Поиск", "Введите название игры или адрес сайта для поиска!", parent=self)
+            return
+
+        self.btn_online.state(["disabled"])
+        self.online_status.config(text="⏳ Идёт поиск в сети...")
+
+        def worker():
+            icons_dir = self.app.config_data["icons_dir"]
+            found_new = []
+            if query.startswith(("http://", "https://", "www.")) or "." in query and " " not in query:
+                found_new.extend(fetch_website_icons_online(query, icons_dir))
+            else:
+                found_new.extend(fetch_steam_icons_online(query, icons_dir))
+
+            self.after(0, self.on_online_search_done, found_new, query)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_online_search_done(self, new_icons, query):
+        self.btn_online.state(["!disabled"])
+        if new_icons:
+            seen_existing = {item[2] for item in self.all_icons}
+            added = 0
+            for item in new_icons:
+                if item[2] not in seen_existing:
+                    self.all_icons.insert(0, item)
+                    seen_existing.add(item[2])
+                    added += 1
+
+            self.app.found_icons_list = self.all_icons
+            labels = [it[1] for it in self.all_icons]
+            self.app.found_icons_cb["values"] = labels
+
+            self.online_status.config(text=f"✓ Найдено логотипов: {added}")
+            self.selected_path = new_icons[0][2]
+            self.render_grid()
+        else:
+            self.online_status.config(text="Ничего не найдено онлайн")
+            messagebox.showinfo("Онлайн-поиск", f"По запросу '{query}' логотипы не найдены в Steam и сети.", parent=self)
+
+    def import_from_clipboard(self):
+        try:
+            text = self.clipboard_get().strip()
+        except Exception:
+            text = ""
+
+        if not text or not text.startswith(("http://", "https://")):
+            messagebox.showinfo("Буфер обмена", "В буфере нет ссылки на картинку или сайт!", parent=self)
+            return
+
+        icons_dir = self.app.config_data["icons_dir"]
+        self.online_status.config(text="Загрузка из буфера...")
+
+        def worker():
+            new_items = []
+            if any(text.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".ico", ".webp", ".svg")):
+                fn = os.path.basename(urlparse(text).path)
+                out_p = os.path.join(icons_dir, f"clip_{fn}")
+                p = download_image_as_png(text, out_p)
+                if p:
+                    new_items.append((135, f"[Буфер] {os.path.basename(p)}", p))
+            else:
+                new_items.extend(fetch_website_icons_online(text, icons_dir))
+
+            self.after(0, self.on_online_search_done, new_items, text)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def browse_custom_icon(self):
+        init_dir = self.app.config_data["icons_dir"]
+        dlg = CustomPathDialog(
+            self, "Выбор логотипа с диска", init_dir, self.colors,
+            mode="file", exts=(".png", ".svg", ".ico", ".jpg", ".jpeg", ".webp", ".xpm")
+        )
+        self.wait_window(dlg)
+        if dlg.result and os.path.isfile(dlg.result):
+            p = dlg.result
+            if p.lower().endswith((".ico", ".jpg", ".jpeg", ".webp")):
+                stem = os.path.splitext(os.path.basename(p))[0].lower()
+                out_p = os.path.join(self.app.config_data["icons_dir"], f"{stem}.png")
+                p = convert_to_png(p, out_p) or p
+
+            entry = (140, f"[Файл] {os.path.basename(p)}", p)
+            self.all_icons.insert(0, entry)
+            self.selected_path = p
+            self.render_grid()
+
+    def on_close(self):
+        # Удаление временных файлов предпросмотра текущей сессии
+        for tmp_f in self.temp_thumbs:
+            try:
+                if os.path.isfile(tmp_f):
+                    os.remove(tmp_f)
+            except OSError:
+                pass
+        self.temp_thumbs.clear()
+        self.destroy()
 
 
 class DesktopCreatorApp(tk.Tk):
@@ -713,6 +1696,28 @@ class DesktopCreatorApp(tk.Tk):
             selectforeground=[("readonly", c["entry_fg"])]
         )
         self.style.configure("TSeparator", background=c["border"])
+        self.style.configure(
+            "Treeview",
+            background=c["entry_bg"],
+            foreground=c["entry_fg"],
+            fieldbackground=c["entry_bg"],
+            bordercolor=c["border"],
+            rowheight=26
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", c["accent"])],
+            foreground=[("selected", "#ffffff")]
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=c["btn_bg"],
+            foreground=c["fg"],
+            bordercolor=c["border"],
+            font=("Sans", 9, "bold"),
+            padding=4
+        )
+        self.style.map("Treeview.Heading", background=[("active", c["border"])])
         self.option_add("*TCombobox*Listbox*Background", c["entry_bg"])
         self.option_add("*TCombobox*Listbox*Foreground", c["entry_fg"])
         self.option_add("*TCombobox*Listbox*selectBackground", c["accent"])
@@ -1151,6 +2156,12 @@ fi
         def add_candidate(score, tag, path):
             if not path or not os.path.isfile(path):
                 return
+            # Автоматическая конвертация любого не-PNG в чистый PNG без лишних действий пользователя
+            if not path.lower().endswith(".png"):
+                stem = os.path.splitext(os.path.basename(path))[0].lower()
+                out_c = os.path.join(icons_dir, f"{stem}_auto.png")
+                path = convert_to_png(path, out_c) or path
+
             rp = os.path.realpath(path)
             if rp in seen_paths:
                 return
@@ -1158,20 +2169,10 @@ fi
             found.append((score, f"[{tag}] {os.path.basename(path)}", path))
 
         if is_url(raw_input):
-            url = normalize_url(raw_input)
-            domain = urlparse(url).netloc.lower().replace("www.", "")
-            stem = domain.split(".")[0] if domain else "website"
-
-            out_png = os.path.join(icons_dir, f"{stem}.png")
-            try:
-                fav_url = f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
-                req = urllib.request.Request(fav_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=3) as resp, open(out_png, "wb") as out_f:
-                    out_f.write(resp.read())
-                if os.path.isfile(out_png) and os.path.getsize(out_png) > 100:
-                    add_candidate(120, "Сайт", out_png)
-            except Exception:
-                pass
+            # Онлайн-парсинг иконок сайта (Google Favicon 128, DuckDuckGo, Touch Icon, og:image)
+            web_icons = fetch_website_icons_online(raw_input, icons_dir)
+            for sc, lbl, p in web_icons:
+                add_candidate(sc, lbl.replace("[", "").replace("]", ""), p)
         else:
             raw_path = os.path.expanduser(raw_input)
             stem = os.path.splitext(os.path.basename(raw_path))[0].lower() if raw_path else ""
@@ -1182,43 +2183,51 @@ fi
                 if raw_path.lower().endswith(".exe"):
                     exe_icons = extract_icons_from_exe_pure_python(raw_path, icons_dir, stem)
                     for idx, p in enumerate(exe_icons):
-                        add_candidate(115 - idx, "Из .exe", p)
+                        add_candidate(120 - idx, "Из .exe", p)
 
-                exts = (".png", ".svg", ".ico", ".jpg", ".jpeg", ".xpm")
+                # Глубокий рекурсивный поиск в папке игры (до 4 уровней вглубь)
+                exts = (".png", ".svg", ".ico", ".jpg", ".jpeg", ".webp", ".xpm")
                 for root, dirs, files in os.walk(folder):
                     rel = os.path.relpath(root, folder)
                     depth = 0 if rel == "." else rel.count(os.sep) + 1
-                    if depth > 3:
+                    if depth > 4:
                         dirs[:] = []
                         continue
                     for f in files:
                         fl = f.lower()
                         if fl.endswith(exts):
                             full_p = os.path.join(root, f)
-                            sc = 50 - depth * 5
+                            sc = 50 - depth * 4
                             if stem and stem in fl:
-                                sc += 45
-                            if any(k in fl for k in ("icon", "logo", "app", "header")):
-                                sc += 25
-                            if fl.endswith(".ico"):
-                                out_conv = os.path.join(icons_dir, f"{stem}_{os.path.splitext(f)[0]}.png")
-                                full_p = convert_to_png(full_p, out_conv) or full_p
+                                sc += 50
+                            if any(k in fl for k in ("icon", "logo", "app", "header", "banner", "splash", "capsule")):
+                                sc += 30
                             add_candidate(sc, "Папка игры", full_p)
 
+                # Поиск AppID и Steam логотипов (локальный кэш + онлайн Steam CDN)
                 appid, _, _ = self.analyze_game_folder(raw_path)
-                if appid:
+                if appid and appid != "480":
+                    # Локальный кэш Steam
                     lib_cache = os.path.join(get_steam_root(), "appcache", "librarycache")
                     if os.path.isdir(lib_cache):
                         for root, _, files in os.walk(lib_cache):
                             for f in files:
                                 if f.startswith(str(appid)) or os.path.basename(root) == str(appid):
-                                    if f.lower().endswith((".png", ".jpg", ".ico")):
+                                    if f.lower().endswith((".png", ".jpg", ".ico", ".webp")):
                                         fp = os.path.join(root, f)
-                                        if fp.lower().endswith(".jpg"):
-                                            out_c = os.path.join(icons_dir, f"steam_{appid}_{os.path.splitext(f)[0]}.png")
-                                            fp = convert_to_png(fp, out_c) or fp
-                                        add_candidate(95, "Steam Cache", fp)
+                                        add_candidate(100, "Steam Cache", fp)
 
+                    # Автоматический онлайн-поиск в Steam CDN без скачивания пользователем
+                    steam_online = fetch_steam_icons_online(appid, icons_dir)
+                    for sc, lbl, p in steam_online:
+                        add_candidate(sc, lbl.replace("[", "").replace("]", ""), p)
+                elif stem and stem not in ("setup", "install", "launcher", "game", "start"):
+                    # Поиск по названию игры в Steam Store API
+                    steam_online = fetch_steam_icons_online(stem, icons_dir)
+                    for sc, lbl, p in steam_online:
+                        add_candidate(sc, lbl.replace("[", "").replace("]", ""), p)
+
+            # Системные иконки Linux
             if stem:
                 sys_dirs = [
                     "/usr/share/pixmaps",
@@ -1231,15 +2240,16 @@ fi
                     if os.path.isdir(sd):
                         for f in os.listdir(sd):
                             if stem in f.lower() and f.lower().endswith((".png", ".svg")):
-                                add_candidate(90, "Система", os.path.join(sd, f))
+                                add_candidate(95, "Система", os.path.join(sd, f))
 
+        # Поиск в личной папке Изображений
         q_stem = os.path.splitext(os.path.basename(raw_input))[0].lower() if raw_input else ""
         if os.path.isdir(icons_dir):
             for f in sorted(os.listdir(icons_dir)):
                 fl = f.lower()
-                if fl.endswith((".png", ".svg", ".ico", ".jpg", ".jpeg")):
+                if fl.endswith((".png", ".svg", ".ico", ".jpg", ".jpeg", ".webp")):
                     fp = os.path.join(icons_dir, f)
-                    sc = 110 if (q_stem and q_stem in fl) else 30
+                    sc = 115 if (q_stem and q_stem in fl) else 35
                     add_candidate(sc, "Изображения", fp)
 
         found.sort(key=lambda x: x[0], reverse=True)
@@ -1303,70 +2313,15 @@ fi
         if not self.found_icons_list:
             self.collect_all_icons(self.file_var.get())
 
-        win = tk.Toplevel(self)
-        win.title("Галерея логотипов")
-        win.geometry("620x460")
-        win.configure(bg=self.colors["bg"])
-        win.transient(self)
+        def on_picked(chosen_path):
+            if chosen_path.lower().endswith((".ico", ".jpg", ".jpeg", ".webp")):
+                stem = os.path.splitext(os.path.basename(chosen_path))[0].lower()
+                out_p = os.path.join(self.config_data["icons_dir"], f"{stem}.png")
+                chosen_path = convert_to_png(chosen_path, out_p) or chosen_path
+            self.icon_var.set(chosen_path)
+            self.status_lbl.config(text=f"✓ Выбран логотип: {os.path.basename(chosen_path)}")
 
-        ttk.Label(win, text="Кликните на логотип для выбора:").pack(anchor="w", padx=12, pady=(10, 4))
-
-        container = ttk.Frame(win, padding=10)
-        container.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(container, bg=self.colors["entry_bg"], highlightthickness=1, highlightbackground=self.colors["border"])
-        sb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        win.thumbs = []
-
-        def pick(p):
-            if p.lower().endswith((".ico", ".jpg", ".jpeg")):
-                stem = os.path.splitext(os.path.basename(p))[0].lower()
-                out_p = os.path.join(self.config_data["icons_dir"], f"{stem}_conv.png")
-                p = convert_to_png(p, out_p) or p
-            self.icon_var.set(p)
-            win.destroy()
-
-        cols = 4
-        for idx, (_, label, path) in enumerate(self.found_icons_list[:48]):
-            r, c = divmod(idx, cols)
-            cell = tk.Frame(scroll_frame, bg=self.colors["btn_bg"], bd=1, relief="flat", padx=6, pady=6)
-            cell.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
-
-            img_lbl = tk.Label(cell, bg=self.colors["btn_bg"], width=64, height=64)
-            img_lbl.pack()
-
-            try:
-                tmp_t = f"/tmp/gal_{os.getpid()}_{idx}.png"
-                if HAS_GDK:
-                    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 52, 52, True)
-                    pb.savev(tmp_t, "png", [], [])
-                    ph = tk.PhotoImage(file=tmp_t)
-                    win.thumbs.append(ph)
-                    img_lbl.config(image=ph)
-                elif path.lower().endswith(".png"):
-                    raw_p = tk.PhotoImage(file=path)
-                    f_sub = max(1, max(raw_p.width(), raw_p.height()) // 52)
-                    ph = raw_p.subsample(f_sub, f_sub)
-                    win.thumbs.append(ph)
-                    img_lbl.config(image=ph)
-            except Exception:
-                img_lbl.config(text="PNG", fg=self.colors["fg"], width=8, height=3)
-
-            short_lbl = label[:18] + ("…" if len(label) > 18 else "")
-            txt_lbl = tk.Label(cell, text=short_lbl, bg=self.colors["btn_bg"], fg=self.colors["fg"], font=("Sans", 8))
-            txt_lbl.pack(pady=(4, 0))
-
-            for w in (cell, img_lbl, txt_lbl):
-                w.bind("<Button-1>", lambda e, p=path: pick(p))
+        IconGalleryDialog(self, self, self.found_icons_list, on_picked)
 
     def pick_binary(self):
         cur = self.file_var.get().strip().strip("\"'")
@@ -1900,4 +2855,3 @@ fi
 if __name__ == "__main__":
     app = DesktopCreatorApp()
     app.mainloop()
-    #yay -S --needed tk python-gobject gdk-pixbuf2 python-pillow icoutils imagemagick desktop-file-utils xdg-utils umu-launcher faugus-launcher
